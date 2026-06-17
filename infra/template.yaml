@@ -1,0 +1,660 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ValueOS v0.1 — Agentic Beta
+  Serverless AI-native platform for LLM cost intelligence and governance.
+  Covers PRD requirements: VI-001, VI-002, VI-007, GF-006, GF-007
+
+# ═══════════════════════════════════════════════════
+# PARAMETERS
+# ═══════════════════════════════════════════════════
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment stage
+
+  AnthropicApiKeyArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the Anthropic API key
+
+  CognitoDomain:
+    Type: String
+    Default: valueos-beta
+    Description: Cognito hosted UI domain prefix
+
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: CORS allowed origin (restrict in prod)
+
+# ═══════════════════════════════════════════════════
+# GLOBAL SETTINGS
+# ═══════════════════════════════════════════════════
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 30
+    Architectures: [arm64]          # Graviton — 20% cheaper, 20% faster
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        USAGE_TABLE: !Ref UsageEventsTable
+        COST_TABLE: !Ref CostRecordsTable
+        AUDIT_TABLE: !Ref AuditLogTable
+        TENANT_TABLE: !Ref TenantConfigTable
+        INSIGHTS_TABLE: !Ref InsightsTable
+        TIMESTREAM_DB: !Ref TimestreamDatabase
+        TIMESTREAM_USAGE_TABLE: !Ref TimestreamUsageTable
+        ANTHROPIC_SECRET_ARN: !Ref AnthropicApiKeyArn
+        REPORT_BUCKET: !Ref ReportBucket
+    Tags:
+      Project: ValueOS
+      Stage: !Ref Stage
+      ManagedBy: SAM
+
+# ═══════════════════════════════════════════════════
+# RESOURCES
+# ═══════════════════════════════════════════════════
+Resources:
+
+  # ─────────────────────────────────────────────────
+  # COGNITO — Authentication & RBAC (GF-006)
+  # ─────────────────────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub valueos-${Stage}-users
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      # Password policy for enterprise readiness
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      # Custom attributes for tenant isolation and RBAC
+      Schema:
+        - Name: tenant_id
+          AttributeDataType: String
+          Mutable: false
+          Required: false
+        - Name: role
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+          # Values: admin | analyst | viewer
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub valueos-${Stage}-app
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      # Token validity for session management
+      AccessTokenValidity: 1       # 1 hour
+      IdTokenValidity: 1           # 1 hour
+      RefreshTokenValidity: 30     # 30 days
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      # OAuth2 configuration for SSO federation
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - http://localhost:3000/callback
+        - !Sub https://${Stage}.valueos.app/callback
+      SupportedIdentityProviders: [COGNITO]
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ${CognitoDomain}-${Stage}
+      UserPoolId: !Ref UserPool
+
+  # Cognito Authorizer for API Gateway
+  CognitoAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      IdentitySource: $request.header.Authorization
+      Name: CognitoJWT
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+
+  # ─────────────────────────────────────────────────
+  # API GATEWAY — HTTP API (cheaper + faster than REST)
+  # ─────────────────────────────────────────────────
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub valueos-${Stage}-api
+      ProtocolType: HTTP
+      Description: ValueOS v0.1 Beta API
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref AllowedOrigin
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: [Authorization, Content-Type, X-Tenant-Id]
+        MaxAge: 86400
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: !Ref Stage
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+  # ─────────────────────────────────────────────────
+  # DYNAMODB TABLES — Multi-tenant data layer
+  # ─────────────────────────────────────────────────
+
+  # VI-001: Raw LLM usage events (write-optimized)
+  UsageEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub valueos-${Stage}-usage-events
+      BillingMode: PAY_PER_REQUEST    # Serverless — scales to zero
+      # PK: tenant_id, SK: event_id (ULID for time-sorted ordering)
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: event_id
+          AttributeType: S
+        - AttributeName: recorded_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+        - AttributeName: event_id
+          KeyType: RANGE
+      # GSI for time-range queries on the dashboard
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-time-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+            - AttributeName: recorded_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      # Enable DynamoDB Streams for event-driven cost calculation
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      # Auto-archive old data to S3 via export (cost optimization)
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true              # AES-256 encryption at rest (NFR 7.3)
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true                 # Auto-expire raw events after 90 days
+
+  # VI-002: Calculated cost records (read-optimized for dashboards)
+  CostRecordsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub valueos-${Stage}-cost-records
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: cost_record_id
+          AttributeType: S
+        - AttributeName: date_provider
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+        - AttributeName: cost_record_id
+          KeyType: RANGE
+      # GSI for aggregation queries: cost by date + provider
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-dateprovider-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+            - AttributeName: date_provider
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # GF-007: Immutable audit log with hash-chain integrity
+  AuditLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub valueos-${Stage}-audit-log
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: log_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+        - AttributeName: log_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-time-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # Tenant configuration (providers, API keys, preferences)
+  TenantConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub valueos-${Stage}-tenant-config
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: config_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+        - AttributeName: config_key
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+
+  # AI-generated insights storage
+  InsightsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub valueos-${Stage}-insights
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: insight_id
+          AttributeType: S
+        - AttributeName: generated_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+        - AttributeName: insight_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-time-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+            - AttributeName: generated_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  # ─────────────────────────────────────────────────
+  # TIMESTREAM — Time-series analytics for dashboards
+  # ─────────────────────────────────────────────────
+  TimestreamDatabase:
+    Type: AWS::Timestream::Database
+    Properties:
+      DatabaseName: !Sub valueos-${Stage}
+
+  TimestreamUsageTable:
+    Type: AWS::Timestream::Table
+    Properties:
+      DatabaseName: !Ref TimestreamDatabase
+      TableName: llm_usage_metrics
+      RetentionProperties:
+        MemoryStoreRetentionPeriodInHours: "168"   # 7 days hot
+        MagneticStoreRetentionPeriodInDays: "365"  # 1 year cold
+
+  # ─────────────────────────────────────────────────
+  # S3 — Report storage and audit archival
+  # ─────────────────────────────────────────────────
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub valueos-${Stage}-reports-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldReports
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ─────────────────────────────────────────────────
+  # LAMBDA FUNCTIONS — Core services
+  # ─────────────────────────────────────────────────
+
+  # VI-001: LLM Usage Ingestion Pipeline
+  IngestionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub valueos-${Stage}-ingestion
+      Handler: handler.lambda_handler
+      CodeUri: services/ingestion-pipeline/src/
+      Description: "VI-001: Ingest LLM usage events from provider APIs"
+      MemorySize: 512
+      Timeout: 30
+      # Provisioned concurrency for consistent latency (optional for prod)
+      # ProvisionedConcurrencyConfig:
+      #   ProvisionedConcurrentExecutions: 5
+      Events:
+        IngestUsage:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/v1/ingestion/llm-usage
+            Method: POST
+            Auth:
+              Authorizer: !Ref CognitoAuthorizer
+        BatchIngest:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/v1/ingestion/batch
+            Method: POST
+            Auth:
+              Authorizer: !Ref CognitoAuthorizer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsageEventsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditLogTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - timestream:WriteRecords
+                - timestream:DescribeEndpoints
+              Resource: "*"
+
+  # VI-002: Cost Calculation Engine (triggered by DynamoDB Stream)
+  CostEngineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub valueos-${Stage}-cost-engine
+      Handler: handler.lambda_handler
+      CodeUri: services/cost-engine/src/
+      Description: "VI-002: Calculate token costs from usage events (event-driven)"
+      MemorySize: 512
+      Timeout: 60
+      Events:
+        UsageStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt UsageEventsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 25
+            MaximumBatchingWindowInSeconds: 5
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName": ["INSERT"]}'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CostRecordsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TenantConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditLogTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - timestream:WriteRecords
+                - timestream:DescribeEndpoints
+              Resource: "*"
+
+  # Dashboard Query API
+  DashboardApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub valueos-${Stage}-dashboard-api
+      Handler: handler.lambda_handler
+      CodeUri: services/dashboard-api/src/
+      Description: "Dashboard query endpoints for usage, costs, anomalies, insights"
+      MemorySize: 512
+      Timeout: 30
+      Events:
+        GetUsageSummary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/v1/usage/summary
+            Method: GET
+            Auth:
+              Authorizer: !Ref CognitoAuthorizer
+        GetCostBreakdown:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/v1/costs/breakdown
+            Method: GET
+            Auth:
+              Authorizer: !Ref CognitoAuthorizer
+        GetAnomalies:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/v1/anomalies
+            Method: GET
+            Auth:
+              Authorizer: !Ref CognitoAuthorizer
+        GetInsights:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/v1/insights
+            Method: GET
+            Auth:
+              Authorizer: !Ref CognitoAuthorizer
+        GetForecast:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/v1/forecast
+            Method: GET
+            Auth:
+              Authorizer: !Ref CognitoAuthorizer
+        GetAuditLog:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/v1/audit/logs
+            Method: GET
+            Auth:
+              Authorizer: !Ref CognitoAuthorizer
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsageEventsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref CostRecordsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AuditLogTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref InsightsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - timestream:Select
+                - timestream:DescribeEndpoints
+              Resource: "*"
+
+  # ─────────────────────────────────────────────────
+  # AI AGENTS — Claude-powered agentic intelligence
+  # ─────────────────────────────────────────────────
+
+  # VI-007: Anomaly Detection Agent (runs every 15 minutes)
+  AnomalyDetectorAgent:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub valueos-${Stage}-agent-anomaly
+      Handler: handler.lambda_handler
+      CodeUri: services/ai-agents/anomaly-detector/src/
+      Description: "VI-007: AI agent that detects cost anomalies using Claude"
+      MemorySize: 1024
+      Timeout: 120
+      Events:
+        ScheduledRun:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(15 minutes)
+            Description: "Run anomaly detection every 15 minutes"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CostRecordsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TenantConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref InsightsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditLogTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref AnthropicApiKeyArn
+            - Effect: Allow
+              Action:
+                - timestream:Select
+                - timestream:DescribeEndpoints
+              Resource: "*"
+
+  # Insight Generator Agent (runs daily at 6am UTC)
+  InsightGeneratorAgent:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub valueos-${Stage}-agent-insights
+      Handler: handler.lambda_handler
+      CodeUri: services/ai-agents/insight-generator/src/
+      Description: "AI agent that generates daily executive insights using Claude"
+      MemorySize: 1024
+      Timeout: 300
+      Events:
+        DailyInsights:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(0 6 * * ? *)
+            Description: "Generate daily executive insights at 6am UTC"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CostRecordsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UsageEventsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TenantConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref InsightsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditLogTable
+        - S3CrudPolicy:
+            BucketName: !Ref ReportBucket
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref AnthropicApiKeyArn
+            - Effect: Allow
+              Action:
+                - timestream:Select
+                - timestream:DescribeEndpoints
+              Resource: "*"
+
+  # Cost Forecaster Agent (runs daily at 7am UTC, after insights)
+  CostForecasterAgent:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub valueos-${Stage}-agent-forecaster
+      Handler: handler.lambda_handler
+      CodeUri: services/ai-agents/cost-forecaster/src/
+      Description: "AI agent that generates cost forecasts using Claude trend analysis"
+      MemorySize: 1024
+      Timeout: 300
+      Events:
+        DailyForecast:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(0 7 * * ? *)
+            Description: "Generate daily cost forecasts at 7am UTC"
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CostRecordsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TenantConfigTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref InsightsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AuditLogTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref AnthropicApiKeyArn
+            - Effect: Allow
+              Action:
+                - timestream:Select
+                - timestream:DescribeEndpoints
+              Resource: "*"
+
+# ═══════════════════════════════════════════════════
+# OUTPUTS
+# ═══════════════════════════════════════════════════
+Outputs:
+  ApiEndpoint:
+    Description: "ValueOS API base URL"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+
+  UserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: "Cognito User Pool Client ID"
+    Value: !Ref UserPoolClient
+
+  CognitoLoginUrl:
+    Description: "Cognito Hosted UI login URL"
+    Value: !Sub "https://${CognitoDomain}-${Stage}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=code&scope=openid+email+profile&redirect_uri=http://localhost:3000/callback"
+
+  UsageEventsTableName:
+    Description: "DynamoDB usage events table"
+    Value: !Ref UsageEventsTable
+
+  ReportBucketName:
+    Description: "S3 bucket for generated reports"
+    Value: !Ref ReportBucket
