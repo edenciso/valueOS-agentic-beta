@@ -1,4 +1,4 @@
-# ValueOS v0.1 — Agentic Beta
+# ValueOS Agentic Beta
 
 ## AI-Native Serverless Deployment for AWS
 
