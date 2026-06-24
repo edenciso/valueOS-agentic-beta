@@ -85,3 +85,6 @@ valueos-beta/
 ### Cost Estimate (Dev/Beta)
 
 At beta scale (< 10K events/day, 3 tenants), the entire platform runs for approximately **$45–80/month** on AWS, thanks to the serverless architecture scaling to zero between requests.
+
+### License
+Proprietary — ValueLayer 2026. All rights reserved.
